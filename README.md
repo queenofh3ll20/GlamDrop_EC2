@@ -21,8 +21,6 @@
 
 </div>
 
----
-
 ## 📑 Indice
 
 - [Panoramica](#-panoramica)
@@ -33,7 +31,6 @@
 - [Deployment](#-deployment-su-aws)
 - [Configurazione](#-configurazione-variabili-dambiente-e-secret-kubernetes)
 - [Test Automatizzati](#-test-automatizzati)
-- [Sicurezza](#️-sicurezza-hardening-e-devsecops)
 - [Teardown](#-teardown-dellinfrastruttura)
 - [Struttura del Progetto](#-struttura-del-progetto)
 
@@ -64,8 +61,6 @@ Per mitigare il **Thundering Herd Problem** ed evitare fenomeni di *overselling*
 2. **Latenza Sub-millisecondo**: Il sistema risponde immediatamente con HTTP `202 Accepted` all'unico vincitore del claim e con HTTP `409 Conflict` a tutti gli altri tentativi concorrenti in $< 2\text{ms}$.
 3. **Persistenza Asincrona Event-Driven**: Il claim confermato viene pubblicato su una coda dedicata (**RabbitMQ**) per la finalizzazione asincrona su database relazionale (**PostgreSQL**) e l'aggiornamento in tempo reale delle agende.
 
-![divider](https://capsule-render.vercel.app/api?type=soft&color=0:FF69B4,100:FFA500&height=3&section=header)
-
 ### ✨ Funzionalità principali
 
 | Area | Funzionalità |
@@ -76,7 +71,6 @@ Per mitigare il **Thundering Herd Problem** ed evitare fenomeni di *overselling*
 | 🔔 **Notifiche Event-Driven** | Architettura a eventi tramite code RabbitMQ: notifiche contestuali per prenotazioni, cancellazioni, riscatti Drop e recensioni |
 | ⭐ **Recensioni & Valutazioni** | Sistema di feedback a 5 stelle con commenti e ricalcolo automatico del punteggio medio del salone |
 
----
 
 ## 🏗 Architettura & Flusso degli Eventi
 
@@ -115,8 +109,6 @@ Per mitigare il **Thundering Herd Problem** ed evitare fenomeni di *overselling*
 | **Container Registry** | Docker Multi-Stage | **Amazon ECR** | Repository privato con scansione automatica vulnerabilità e lifecycle policies. |
 | **Monitoring & Alarms** | CloudWatch Metrics | **Amazon CloudWatch** | Allarmi proattivi su CPU Control Plane/Worker, storage RDS e codici 5XX sull'ALB. |
 
----
-
 ## ⚙️ Infrastruttura
 
 ### 🖥️ Cluster Kubernetes su EC2
@@ -127,7 +119,6 @@ Per mitigare il **Thundering Herd Problem** ed evitare fenomeni di *overselling*
 | `glamdrop-worker-asg` (x2) | ⚙️ Worker Nodes | `t3.micro` | 2 | 1 GB | Auto Scaling Group Multi-AZ (AZ-a & AZ-b), Self-Join via SSM |
 | `glamdrop-cni` | 🌐 Network Driver | Calico CNI | — | — | Overlay VXLAN + NetworkPolicies L3/L4 Zero-Trust |
 
----
 
 ## 🚀 Deployment su AWS
 
@@ -185,8 +176,6 @@ chmod +x deploy.sh
 ./deploy.sh
 ```
 
-![divider](https://capsule-render.vercel.app/api?type=soft&color=0:FF69B4,100:FFA500&height=3&section=header)
-
 ### 🪟 Opzione B — Deploy da Windows (PowerShell)
 
 #### ✅ Prerequisiti
@@ -227,8 +216,6 @@ wsl bash -c "cd ansible && bash run-ansible.sh"
 .\deploy.ps1
 ```
 
-![divider](https://capsule-render.vercel.app/api?type=soft&color=0:FF69B4,100:FFA500&height=3&section=header)
-
 ### 📋 Fasi Eseguite dallo Script di Deploy
 
 Indipendentemente dalla piattaforma, lo script di deploy esegue automaticamente:
@@ -243,8 +230,6 @@ Al termine, l'applicazione sarà accessibile pubblicamente all'URL CloudFront:
 ```
 👉 https://dxxxxxxxxxxxx.cloudfront.net
 ```
-
----
 
 ## 🔧 Configurazione Variabili d'Ambiente e Secret Kubernetes
 
