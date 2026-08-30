@@ -1,0 +1,5 @@
+# site.yml — Master Playbook per la configurazione del cluster K8s
+# NOTA: I nodi Worker effettuano il self-bootstrap tramite Auto Scaling Group (Launch Template + SSM).
+---
+- import_playbook: 00-prerequisites.yml
+- import_playbook: 01-control-plane.yml

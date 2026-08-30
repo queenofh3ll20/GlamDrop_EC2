@@ -1,0 +1,351 @@
+name: GlamDrop Cloud CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  AWS_REGION: eu-south-1
+  PROJECT_NAME: glamdrop
+
+jobs:
+  # --- FASE 1: DevSecOps Scans (Checkov, Gitleaks, Semgrep) ---
+  security-scans:
+    name: Security & SAST Scans
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Gitleaks Secret Detection
+        uses: gitleaks/gitleaks-action@v2
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Semgrep SAST Scan (Node.js & Python)
+        continue-on-error: true
+        run: |
+          python3 -m pip install --break-system-packages semgrep || pip install semgrep || true
+          semgrep scan --config auto --error services/ || true
+
+      - name: Checkov IaC Scan (K8s & Terraform)
+        continue-on-error: true
+        run: |
+          pip install --break-system-packages checkov || pip install checkov || true
+          checkov -d k8s/ --framework kubernetes --soft-fail || true
+          checkov -d terraform/ --framework terraform --soft-fail || true
+
+  # --- FASE 2: Build & Push Immagini Docker su ECR ---
+  build-and-push:
+    name: Build & Push Container Images to ECR
+    needs: security-scans
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+
+      - name: Log in to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build & Push Microservizi (linux/amd64)
+        id: build-images
+        env:
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          for SERVICE in auth-service booking-service drop-service notification-service; do
+            echo "--> Building & pushing ${SERVICE} for linux/amd64..."
+            docker buildx build --platform linux/amd64 \
+              -t $REGISTRY/${{ env.PROJECT_NAME }}/${SERVICE}:${IMAGE_TAG} \
+              -t $REGISTRY/${{ env.PROJECT_NAME }}/${SERVICE}:v1.0.0 \
+              --push services/${SERVICE}
+          done
+
+  # --- FASE 3: Deploy Frontend su S3 & Invalidate CloudFront ---
+  deploy-frontend:
+    name: Deploy Frontend to S3 & CloudFront
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+
+      - name: Sync Static Files to S3
+        env:
+          S3_BUCKET: ${{ secrets.S3_FRONTEND_BUCKET }}
+        run: |
+          if [ -z "$S3_BUCKET" ]; then
+            S3_BUCKET=$(aws s3api list-buckets --query "Buckets[?starts_with(Name, '${{ env.PROJECT_NAME }}-frontend')].Name" --output text | awk '{print $1}')
+          fi
+          if [ -z "$S3_BUCKET" ]; then
+            echo "[ERRORE] S3_FRONTEND_BUCKET non trovato su AWS."
+            exit 1
+          fi
+          echo "Sincronizzazione su s3://${S3_BUCKET}..."
+          aws s3 sync frontend/ s3://${S3_BUCKET}/ --exclude "Dockerfile" --exclude "nginx.conf" --delete
+
+      - name: Invalidate CloudFront Cache
+        env:
+          CLOUDFRONT_DIST_ID: ${{ secrets.CLOUDFRONT_DISTRIBUTION_ID }}
+        run: |
+          if [ -z "$CLOUDFRONT_DIST_ID" ]; then
+            CLOUDFRONT_DIST_ID=$(aws cloudfront list-distributions --query "DistributionList.Items[?contains(Origins.Items[0].Id, '${{ env.PROJECT_NAME }}') || contains(Comment, '${{ env.PROJECT_NAME }}')].Id" --output text | awk '{print $1}')
+          fi
+          if [ -n "$CLOUDFRONT_DIST_ID" ] && [ "$CLOUDFRONT_DIST_ID" != "None" ]; then
+            echo "Invalidazione CloudFront ${CLOUDFRONT_DIST_ID}..."
+            aws cloudfront create-invalidation --distribution-id "$CLOUDFRONT_DIST_ID" --paths "/*" || true
+          fi
+
+  # --- FASE 4: Deploy Kubernetes Manifests via AWS SSM ---
+  deploy-k8s:
+    name: Deploy Microservices to Kubernetes via SSM
+    needs: [build-and-push, deploy-frontend]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+
+      - name: Discover Control Plane Instance
+        id: discover
+        run: |
+          CONTROL_PLANE_ID="${{ secrets.CONTROL_PLANE_INSTANCE_ID }}"
+          if [ -z "$CONTROL_PLANE_ID" ]; then
+            CONTROL_PLANE_ID=$(aws ec2 describe-instances \
+              --filters "Name=tag:Name,Values=${{ env.PROJECT_NAME }}-control-plane-1" "Name=instance-state-name,Values=running" \
+              --query "Reservations[0].Instances[0].InstanceId" --output text 2>/dev/null || true)
+          fi
+          if [ -z "$CONTROL_PLANE_ID" ] || [ "$CONTROL_PLANE_ID" = "None" ]; then
+            echo "[ERRORE] Control Plane EC2 instance non trovata."
+            exit 1
+          fi
+          ACCOUNT_ID=$(aws sts get-caller-identity --query "Account" --output text)
+          echo "control_plane_id=$CONTROL_PLANE_ID" >> $GITHUB_OUTPUT
+          echo "account_id=$ACCOUNT_ID" >> $GITHUB_OUTPUT
+          echo "ecr_registry=${ACCOUNT_ID}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com" >> $GITHUB_OUTPUT
+          echo "[OK] Control Plane: $CONTROL_PLANE_ID | Registry: ${ACCOUNT_ID}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com"
+
+      - name: Transfer K8s Manifests via SSM
+        env:
+          CONTROL_PLANE_ID: ${{ steps.discover.outputs.control_plane_id }}
+        run: |
+          echo "[INFO] Packaging K8s manifests..."
+          K8S_TAR_B64=$(tar -czf - -C k8s . | base64)
+
+          # Build transfer commands: heredoc-based base64 decode + tar extract
+          {
+            echo "mkdir -p /home/ubuntu/k8s"
+            echo "base64 -d << 'K8S_TAR_EOF' | tar -xzf - -C /home/ubuntu/k8s/"
+            echo "$K8S_TAR_B64"
+            echo "K8S_TAR_EOF"
+            echo "chown -R ubuntu:ubuntu /home/ubuntu/k8s"
+            echo "echo TRANSFER_OK"
+          } | jq -R -s 'split("\n") | map(select(length > 0))' > /tmp/transfer-commands.json
+
+          jq -n \
+            --arg instance "$CONTROL_PLANE_ID" \
+            --argjson commands "$(cat /tmp/transfer-commands.json)" \
+            '{
+              InstanceIds: [$instance],
+              DocumentName: "AWS-RunShellScript",
+              TimeoutSeconds: 120,
+              Parameters: { commands: $commands }
+            }' > /tmp/transfer-cmd.json
+
+          TRANSFER_ID=$(aws ssm send-command --cli-input-json file:///tmp/transfer-cmd.json --query "Command.CommandId" --output text)
+          echo "  -> SSM Command: $TRANSFER_ID"
+
+          for i in $(seq 1 30); do
+            STATUS=$(aws ssm get-command-invocation --command-id "$TRANSFER_ID" --instance-id "$CONTROL_PLANE_ID" --query "Status" --output text 2>/dev/null || echo "Pending")
+            case "$STATUS" in
+              Success)
+                echo "[OK] Manifests transferred!"
+                break ;;
+              Failed|Cancelled|TimedOut)
+                echo "[ERRORE] Transfer failed: $STATUS"
+                aws ssm get-command-invocation --command-id "$TRANSFER_ID" --instance-id "$CONTROL_PLANE_ID" --query "StandardErrorContent" --output text || true
+                exit 1 ;;
+            esac
+            echo "  -> $STATUS ($i/30)"
+            sleep 5
+          done
+
+      - name: Deploy to Kubernetes Cluster
+        env:
+          CONTROL_PLANE_ID: ${{ steps.discover.outputs.control_plane_id }}
+          ECR_REGISTRY: ${{ steps.discover.outputs.ecr_registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          # --- Create deploy script (runs on Control Plane as ubuntu user) ---
+          # Quoted heredoc: no variable expansion. Placeholders replaced by sed below.
+          cat > /tmp/deploy-script.sh << 'GLAMDROP_DEPLOY_EOF'
+          #!/bin/bash
+          set -e
+          export KUBECONFIG=/home/ubuntu/.kube/config
+
+          echo "0. Waiting for worker nodes..."
+          for i in $(seq 1 30); do
+            READY=$(kubectl get nodes --no-headers 2>/dev/null | grep -c ' Ready' || echo 0)
+            if [ "$READY" -ge 2 ]; then
+              echo "  -> Workers ready: $READY"
+              break
+            fi
+            echo "  -> Waiting ($READY/2 ready, attempt $i/30)..."
+            sleep 10
+          done
+
+          echo "1. Namespace e NetworkPolicies..."
+          kubectl apply -f /home/ubuntu/k8s/namespace.yaml
+          kubectl apply -f /home/ubuntu/k8s/network-policy.yaml
+          sleep 5
+
+          echo "2. ECR authentication..."
+          ECR_PASS=$(aws ecr get-login-password --region __AWS_REGION__)
+          kubectl create secret docker-registry ecr-secret -n glamdrop \
+            --docker-server=__ECR_REGISTRY__ --docker-username=AWS --docker-password="$ECR_PASS" \
+            --dry-run=client -o yaml | kubectl apply -f -
+          kubectl patch serviceaccount default -n glamdrop \
+            -p '{"imagePullSecrets": [{"name": "ecr-secret"}]}' || true
+          kubectl apply -f /home/ubuntu/k8s/ecr-cronjob.yaml || true
+
+          echo "3. Secrets from SSM Parameter Store..."
+          JWT_SEC=$(aws ssm get-parameter --name /glamdrop/jwt_secret --with-decryption --query Parameter.Value --output text --region __AWS_REGION__ 2>/dev/null || echo "")
+          DB_P=$(aws ssm get-parameter --name /glamdrop/db_password --with-decryption --query Parameter.Value --output text --region __AWS_REGION__ 2>/dev/null || echo "")
+          PG_HOST=$(aws ssm get-parameter --name /glamdrop/postgres_host --query Parameter.Value --output text --region __AWS_REGION__ 2>/dev/null || echo "")
+          REDIS_TOKEN=$(aws ssm get-parameter --name /glamdrop/redis_auth_token --with-decryption --query Parameter.Value --output text --region __AWS_REGION__ 2>/dev/null || echo "")
+          REDIS_HOST=$(aws ssm get-parameter --name /glamdrop/redis_host --query Parameter.Value --output text --region __AWS_REGION__ 2>/dev/null || echo "")
+          REDIS_URL=$(aws ssm get-parameter --name /glamdrop/redis_url --with-decryption --query Parameter.Value --output text --region __AWS_REGION__ 2>/dev/null || echo "")
+          RABBIT_P=$(aws ssm get-parameter --name /glamdrop/rabbitmq_password --with-decryption --query Parameter.Value --output text --region __AWS_REGION__ 2>/dev/null || echo "")
+          RABBIT_URL=$(aws ssm get-parameter --name /glamdrop/rabbitmq_url --with-decryption --query Parameter.Value --output text --region __AWS_REGION__ 2>/dev/null || echo "")
+
+          kubectl create secret generic glamdrop-secrets -n glamdrop \
+            --from-literal=jwt-secret="$JWT_SEC" \
+            --from-literal=postgres-host="$PG_HOST" \
+            --from-literal=postgres-port="5432" \
+            --from-literal=postgres-user="postgres" \
+            --from-literal=postgres-password="$DB_P" \
+            --from-literal=postgres-db="glamdrop" \
+            --from-literal=redis-url="$REDIS_URL" \
+            --from-literal=redis-host="$REDIS_HOST" \
+            --from-literal=redis-auth-token="$REDIS_TOKEN" \
+            --from-literal=rabbitmq-url="$RABBIT_URL" \
+            --from-literal=rabbitmq-user="glamdrop" \
+            --from-literal=rabbitmq-password="$RABBIT_P" \
+            --from-literal=dynamodb-notifications-table="glamdrop-notifications" \
+            --from-literal=aws-region="__AWS_REGION__" \
+            --from-literal=auth-service-url="http://auth-service:3001" \
+            --from-literal=booking-service-url="http://booking-service:3002" \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+          echo "4. Image tags -> __IMAGE_TAG__..."
+          sed -i 's|image: .*auth-service:.*|image: __ECR_REGISTRY__/glamdrop/auth-service:__IMAGE_TAG__|' /home/ubuntu/k8s/auth-service.yaml
+          sed -i 's|image: .*booking-service:.*|image: __ECR_REGISTRY__/glamdrop/booking-service:__IMAGE_TAG__|' /home/ubuntu/k8s/booking-service.yaml
+          sed -i 's|image: .*drop-service:.*|image: __ECR_REGISTRY__/glamdrop/drop-service:__IMAGE_TAG__|' /home/ubuntu/k8s/drop-service.yaml
+          sed -i 's|image: .*notification-service:.*|image: __ECR_REGISTRY__/glamdrop/notification-service:__IMAGE_TAG__|' /home/ubuntu/k8s/notification-service.yaml
+
+          echo "5. Ingress NGINX Controller..."
+          kubectl apply -f /home/ubuntu/k8s/ingress-nginx.yaml
+          kubectl delete ValidatingWebhookConfiguration ingress-nginx-admission --ignore-not-found || true
+
+          echo "6. Microservizi..."
+          kubectl apply -f /home/ubuntu/k8s/auth-service.yaml
+          kubectl apply -f /home/ubuntu/k8s/booking-service.yaml
+          kubectl apply -f /home/ubuntu/k8s/drop-service.yaml
+          kubectl apply -f /home/ubuntu/k8s/notification-service.yaml
+          kubectl apply -f /home/ubuntu/k8s/hpa-pdb.yaml || true
+          kubectl apply -f /home/ubuntu/k8s/ingress.yaml
+
+          echo "7. Rollout restart..."
+          kubectl rollout restart deployment auth-service booking-service drop-service notification-service -n glamdrop || true
+          sleep 5
+
+          echo "8. Pod status:"
+          kubectl get pods -n glamdrop -o wide
+          kubectl get pods -n ingress-nginx
+          GLAMDROP_DEPLOY_EOF
+
+          # --- Replace placeholders with actual CI/CD values ---
+          sed -i "s|__ECR_REGISTRY__|${ECR_REGISTRY}|g" /tmp/deploy-script.sh
+          sed -i "s|__IMAGE_TAG__|${IMAGE_TAG}|g" /tmp/deploy-script.sh
+          sed -i "s|__AWS_REGION__|${{ env.AWS_REGION }}|g" /tmp/deploy-script.sh
+
+          # --- Build SSM command: write script to file on instance, execute as ubuntu ---
+          {
+            echo "cat > /tmp/glamdrop-ci-deploy.sh << 'GLAMDROP_SCRIPT_END'"
+            cat /tmp/deploy-script.sh
+            echo "GLAMDROP_SCRIPT_END"
+            echo "chmod +x /tmp/glamdrop-ci-deploy.sh"
+            echo "sudo -u ubuntu bash /tmp/glamdrop-ci-deploy.sh"
+            echo "EXIT_CODE=\$?"
+            echo "rm -f /tmp/glamdrop-ci-deploy.sh"
+            echo "exit \$EXIT_CODE"
+          } | jq -R -s 'split("\n") | map(select(length > 0))' > /tmp/deploy-commands.json
+
+          jq -n \
+            --arg instance "$CONTROL_PLANE_ID" \
+            --argjson commands "$(cat /tmp/deploy-commands.json)" \
+            '{
+              InstanceIds: [$instance],
+              DocumentName: "AWS-RunShellScript",
+              TimeoutSeconds: 600,
+              Parameters: { commands: $commands }
+            }' > /tmp/deploy-cmd.json
+
+          DEPLOY_ID=$(aws ssm send-command --cli-input-json file:///tmp/deploy-cmd.json --query "Command.CommandId" --output text)
+          echo "[INFO] Deploy SSM Command: $DEPLOY_ID"
+
+          for i in $(seq 1 60); do
+            STATUS=$(aws ssm get-command-invocation --command-id "$DEPLOY_ID" --instance-id "$CONTROL_PLANE_ID" --query "Status" --output text 2>/dev/null || echo "Pending")
+            case "$STATUS" in
+              Success)
+                echo ""
+                echo "[OK] Deploy completato con successo!"
+                echo "---------------------------------"
+                aws ssm get-command-invocation --command-id "$DEPLOY_ID" --instance-id "$CONTROL_PLANE_ID" --query "StandardOutputContent" --output text || true
+                exit 0 ;;
+              Failed|Cancelled|TimedOut)
+                echo ""
+                echo "[ERRORE] Deploy fallito: $STATUS"
+                echo "-- stdout --"
+                aws ssm get-command-invocation --command-id "$DEPLOY_ID" --instance-id "$CONTROL_PLANE_ID" --query "StandardOutputContent" --output text || true
+                echo "-- stderr --"
+                aws ssm get-command-invocation --command-id "$DEPLOY_ID" --instance-id "$CONTROL_PLANE_ID" --query "StandardErrorContent" --output text || true
+                exit 1 ;;
+            esac
+            echo "  -> $STATUS ($i/60)"
+            sleep 10
+          done
+          echo "[WARN] Timeout raggiunto. Verificare manualmente sul cluster."
+          exit 1

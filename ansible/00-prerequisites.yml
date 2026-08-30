@@ -1,0 +1,233 @@
+# 00-prerequisites.yml — Eseguito su tutti i nodi prima di kubeadm init/join
+---
+- name: Prerequisiti Kubernetes su tutti i nodi
+  hosts: k8s
+  become: true
+
+  tasks:
+
+    # --- Hostname & Local Resolution ---
+    - name: Recupera l'IP privato del nodo (VPC)
+      shell: hostname -I | awk '{print $1}'
+      register: node_private_ip
+      changed_when: false
+
+    - name: Imposta l'hostname del nodo coerente con l'inventario
+      ansible.builtin.hostname:
+        name: "{{ inventory_hostname }}"
+
+    - name: Assicura la risoluzione del hostname locale in /etc/hosts con IP privato
+      ansible.builtin.lineinfile:
+        path: /etc/hosts
+        line: "{{ node_private_ip.stdout | trim }} {{ inventory_hostname }}"
+        state: present
+
+    # --- Ottimizzazione Rete APT (Forza IPv4 per evitare timeout di risoluzione) ---
+    - name: Forza IPv4 per APT per velocizzare i download
+      copy:
+        dest: /etc/apt/apt.conf.d/99force-ipv4
+        content: |
+          Acquire::ForceIPv4 "true";
+        mode: '0644'
+
+    # --- Swap (Configura 2GB Swap per garantire stabilita e reattivita su t3.micro) ---
+    - name: Verifica se il file di swap esiste gia
+      stat:
+        path: /swapfile
+      register: swapfile_stat
+
+    - name: Crea il file di swap da 2GB
+      command: fallocate -l 2G /swapfile
+      when: not swapfile_stat.stat.exists
+
+    - name: Imposta i permessi corretti per lo swapfile
+      file:
+        path: /swapfile
+        mode: '0600'
+        owner: root
+        group: root
+      when: not swapfile_stat.stat.exists
+
+    - name: Formatta il file come swap
+      command: mkswap /swapfile
+      when: not swapfile_stat.stat.exists
+
+    - name: Attiva lo swapfile
+      command: swapon /swapfile
+      when: not swapfile_stat.stat.exists
+      ignore_errors: true
+
+    - name: Assicura l'attivazione automatica dello swapfile in /etc/fstab
+      lineinfile:
+        path: /etc/fstab
+        line: "/swapfile none swap sw 0 0"
+        state: present
+
+    - name: Imposta swappiness ottimale per t3.micro
+      shell: |
+        echo "vm.swappiness = 10" > /etc/sysctl.d/99-swap.conf
+        sysctl -p /etc/sysctl.d/99-swap.conf
+      changed_when: false
+
+    - name: Configura kubelet per tollerare lo swap su t3.micro
+      copy:
+        dest: /etc/default/kubelet
+        content: |
+          KUBELET_EXTRA_ARGS="--fail-swap-on=false"
+      notify: Restart kubelet
+
+    # --- Moduli kernel ---
+    - name: Carica i moduli kernel richiesti
+      command: modprobe {{ item }}
+      loop:
+        - overlay
+        - br_netfilter
+      changed_when: false
+
+    - name: Rendi i moduli kernel persistenti al riavvio
+      copy:
+        dest: /etc/modules-load.d/k8s.conf
+        content: |
+          overlay
+          br_netfilter
+
+    - name: Imposta i parametri sysctl per il networking di Kubernetes
+      shell: |
+        cat > /etc/sysctl.d/k8s.conf << 'SYSCTL_EOF'
+        net.bridge.bridge-nf-call-iptables = 1
+        net.bridge.bridge-nf-call-ip6tables = 1
+        net.ipv4.ip_forward = 1
+        SYSCTL_EOF
+        sysctl -p /etc/sysctl.d/k8s.conf
+      changed_when: false
+
+    # --- Firewall & Iptables Configuration ---
+    - name: Disabilita UFW firewall locale per evitare blocchi tra nodi e CNI
+      systemd:
+        name: ufw
+        state: stopped
+        enabled: false
+      ignore_errors: true
+
+    - name: Assicura che le policy di default di iptables siano ACCEPT
+      command: iptables -P {{ item }} ACCEPT
+      loop:
+        - INPUT
+        - FORWARD
+        - OUTPUT
+      changed_when: false
+      ignore_errors: true
+
+    - name: Applica immediatamente le regole sysctl del sistema
+      command: sysctl --system
+      changed_when: false
+
+    # --- containerd ---
+    - name: Installa containerd e pacchetti di supporto
+      apt:
+        name:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - gnupg
+          - containerd
+          - conntrack       # Richiesto dai preflight check di kubeadm
+          - unzip
+        state: present
+        update_cache: false
+        lock_timeout: 180
+        dpkg_options: 'force-confdef,force-confold'
+      environment:
+        DEBIAN_FRONTEND: noninteractive
+
+    - name: Verifica se AWS CLI v2 è già installato
+      command: aws --version
+      register: aws_cli_check
+      failed_when: false
+      changed_when: false
+
+    - name: Installa AWS CLI v2 se mancante sul nodo
+      shell: |
+        curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "/tmp/awscliv2.zip"
+        unzip -q -o /tmp/awscliv2.zip -d /tmp
+        /tmp/aws/install --update || true
+        rm -rf /tmp/aws /tmp/awscliv2.zip
+      when: aws_cli_check.rc != 0
+
+    - name: Crea la directory di configurazione per containerd
+      file:
+        path: /etc/containerd
+        state: directory
+        mode: '0755'
+
+    - name: Genera la configurazione di default per containerd con SystemdCgroup abilitato
+      shell: |
+        containerd config default \
+          | sed 's/SystemdCgroup = false/SystemdCgroup = true/' \
+          > /etc/containerd/config.toml
+      args:
+        creates: /etc/containerd/config.toml
+      notify: Restart containerd
+
+    - name: Assicura che il servizio containerd sia avviato ed abilitato
+      service:
+        name: containerd
+        state: started
+        enabled: true
+
+    # --- Pacchetti Kubernetes ---
+    - name: Crea la directory keyrings per apt
+      file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: '0755'
+
+    - name: Scarica la chiave GPG ufficiale di Kubernetes (v1.31)
+      shell: |
+        curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.31/deb/Release.key \
+          | gpg --yes --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+      args:
+        creates: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+
+    - name: Aggiungi il repository apt di Kubernetes
+      copy:
+        dest: /etc/apt/sources.list.d/kubernetes.list
+        content: >
+          deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg]
+          https://pkgs.k8s.io/core:/stable:/v1.31/deb/ /
+
+    - name: Installa kubelet, kubeadm, kubectl
+      shell: |
+        DEBIAN_FRONTEND=noninteractive apt-get update -y
+        DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+          -o Dpkg::Options::="--force-confdef" \
+          -o Dpkg::Options::="--force-confold" \
+          kubelet kubeadm kubectl
+      register: k8s_install_res
+      changed_when: "'Setting up kubelet' in k8s_install_res.stdout or 'Setting up kubeadm' in k8s_install_res.stdout"
+
+    - name: Blocca l'aggiornamento automatico dei pacchetti Kubernetes (hold)
+      dpkg_selections:
+        name: "{{ item }}"
+        selection: hold
+      loop:
+        - kubelet
+        - kubeadm
+        - kubectl
+
+    - name: Abilita ed avvia il servizio kubelet
+      service:
+        name: kubelet
+        state: started
+        enabled: true
+
+  handlers:
+    - name: Restart containerd
+      service:
+        name: containerd
+        state: restarted
+
+    - name: Restart kubelet
+      service:
+        name: kubelet
+        state: restarted
