@@ -23,9 +23,25 @@
 
 ---
 
+## 📑 Indice
+
+- [Panoramica](#-panoramica)
+- [Funzionalità Principali](#-funzionalità-principali)
+- [Architettura & Flusso degli Eventi](#-architettura--flusso-degli-eventi)
+- [Stack Tecnologico & Mappatura Servizi AWS](#-stack-tecnologico--mappatura-servizi-aws)
+- [Infrastruttura](#️-infrastruttura)
+- [Deployment](#-deployment-su-aws)
+- [Configurazione](#-configurazione-variabili-dambiente-e-secret-kubernetes)
+- [Test Automatizzati](#-test-automatizzati)
+- [Sicurezza](#️-sicurezza-hardening-e-devsecops)
+- [Teardown](#-teardown-dellinfrastruttura)
+- [Struttura del Progetto](#-struttura-del-progetto)
+
 ## 🎯 Panoramica
 
-**GlamDrop AWS** (Infrastruttura A) rappresenta l'implementazione cloud-native dell'architettura GlamDrop basata su un cluster Kubernetes autogestito (*self-managed*) su macchine **Amazon EC2**, integrato con l'ecosistema dei servizi gestiti AWS.
+**GlamDrop** è un'applicazione web 3-tier a microservizi per la prenotazione di servizi beauty e la gestione di promozioni flash (*Drop*) a disponibilità limitata. Il sistema copre l'intero ciclo di vita del software: dall'**Infrastructure as Code** (IaC) al **frontend**, integrando orchestrazione dei container, messaggistica asincrona event-driven e gestione della concorrenza ad alte prestazioni.
+
+> Questa versione (**Infrastruttura A**) rappresenta l'implementazione cloud-native su **Amazon Web Services (AWS)** con cluster Kubernetes autogestito (*self-managed*) su macchine **Amazon EC2** e persistenza su servizi gestiti AWS.
 
 La piattaforma mette in relazione tre tipologie di utenti:
 
@@ -33,15 +49,20 @@ La piattaforma mette in relazione tre tipologie di utenti:
 
 | 👤 Ruolo | Descrizione |
 |:---:|---|
-| ![Cliente](https://img.shields.io/badge/Cliente-8A2BE2?style=flat-square) | Ricerca saloni con autocompletamento geografico, prenota trattamenti e riscatta i Drop promozionali |
-| ![Gestore](https://img.shields.io/badge/Gestore-FF69B4?style=flat-square) | Amministra il catalogo servizi, configura orari/turni del personale e monitora le prenotazioni |
-| ![Estetista](https://img.shields.io/badge/Estetista-20B2AA?style=flat-square) | Consulta l'agenda appuntamenti in tempo reale e segnala indisponibilità o assenze |
+| ![Cliente](https://img.shields.io/badge/Cliente-8A2BE2?style=flat-square) | Ricerca saloni con autocompletamento geografico (dataset ISTAT), prenota trattamenti estetici e riscatta i Drop promozionali |
+| ![Gestore](https://img.shields.io/badge/Gestore-FF69B4?style=flat-square) | Amministra il salone, gestisce il catalogo trattamenti, configura turni/orari del personale e monitora le prenotazioni |
+| ![Estetista](https://img.shields.io/badge/Estetista-20B2AA?style=flat-square) | Consulta l'agenda appuntamenti in tempo reale, visualizza i dettagli dei trattamenti e segnala indisponibilità |
 
 </div>
 
 ### ⚡ Il Concetto di "Drop" e la Gestione della Concorrenza
-Il fulcro del sistema sono i **Drop**: promozioni flash a disponibilità limitata generate automaticamente con il **50% di sconto** a seguito di cancellazioni tardive (< 24h dall'appuntamento). 
-Per scongiurare il **Thundering Herd Problem** e l'overselling durante i picchi simultanei di claim, la concorrenza è gestita mediante **script atomici Lua** eseguiti nel single-thread di **Amazon ElastiCache Redis 7**, rispondendo con HTTP `202 Accepted` all'unico vincitore e HTTP `409 Conflict` agli altri utenti in < 2ms, delegando il salvataggio a worker asincroni su **Amazon MQ RabbitMQ**.
+
+Il cuore della piattaforma sono i **Drop**: promozioni flash a disponibilità limitata con **sconto del 50%**, generate automaticamente a seguito di cancellazioni tardive (< 24 ore dall'appuntamento) o create manualmente dai gestori.
+
+Per mitigare il **Thundering Herd Problem** ed evitare fenomeni di *overselling* durante i picchi simultanei di richiesta:
+1. **Lock Atomico in-memory**: La concorrenza sul riscatto è gestita a livello di cache in-memory (**Redis**) tramite operazioni atomiche (`SET NX` / script Lua single-thread).
+2. **Latenza Sub-millisecondo**: Il sistema risponde immediatamente con HTTP `202 Accepted` all'unico vincitore del claim e con HTTP `409 Conflict` a tutti gli altri tentativi concorrenti in $< 2\text{ms}$.
+3. **Persistenza Asincrona Event-Driven**: Il claim confermato viene pubblicato su una coda dedicata (**RabbitMQ**) per la finalizzazione asincrona su database relazionale (**PostgreSQL**) e l'aggiornamento in tempo reale delle agende.
 
 ![divider](https://capsule-render.vercel.app/api?type=soft&color=0:FF69B4,100:FFA500&height=3&section=header)
 
@@ -49,11 +70,11 @@ Per scongiurare il **Thundering Herd Problem** e l'overselling durante i picchi 
 
 | Area | Funzionalità |
 |---|---|
-| 🔐 **Autenticazione & Saloni** | Registrazione multi-ruolo (Cliente, Gestore, Dipendente), login con token JWT firmati, gestione anagrafica e dataset ISTAT dei comuni italiani |
-| 📅 **Prenotazioni & Disponibilità** | Catalogo trattamenti con 7 categorie, calcolo slot a intervalli di 15m, lock pessimistici sul DB relazionale e rilevamento anti-sovrapposizione |
-| ⚡ **Flash Drop & Lock Atomico** | Generazione automatica da disdette tardive, lock atomico in-memory Redis (`HGET` + `HSET`), ingestione asincrona su coda RabbitMQ |
-| 🔔 **Notifiche Event-Driven** | Consumer multithread AMQP su RabbitMQ, formattazione notifiche contestuali e persistenza su tabella NoSQL **Amazon DynamoDB** |
-| 🌐 **Edge Delivery & Sicurezza** | Frontend distribuito su **Amazon S3 + CloudFront CDN**, routing Layer 7 con **ALB + Ingress Nginx** e validazione header segreto `X-Origin-Verify` |
+| 🔐 **Autenticazione & Saloni** | Registrazione multi-ruolo (Cliente, Gestore, Estetista), login stateless con token JWT firmati, validazione geografica basata sul dataset ISTAT dei comuni italiani |
+| 📅 **Prenotazioni & Disponibilità** | Catalogo servizi suddiviso in 7 categorie (~30 trattamenti), calcolo slot a intervalli di 15m, lock sul database con algoritmo di rilevamento anti-sovrapposizione |
+| ⚡ **Flash Drop & Lock Atomico** | Generazione automatica da cancellazioni tardive (sconto 50%), countdown temporizzato, lock atomico in-memory su Redis e ingestione asincrona |
+| 🔔 **Notifiche Event-Driven** | Architettura a eventi tramite code RabbitMQ: notifiche contestuali per prenotazioni, cancellazioni, riscatti Drop e recensioni |
+| ⭐ **Recensioni & Valutazioni** | Sistema di feedback a 5 stelle con commenti e ricalcolo automatico del punteggio medio del salone |
 
 ---
 
@@ -71,42 +92,6 @@ Per scongiurare il **Thundering Herd Problem** e l'overselling durante i picchi 
 
 </div>
 
-### 📸 Schema Architetturale AWS
-
-```
-[ Utente / Browser ]
-        │
-        ▼
-[ Amazon CloudFront CDN ] (PriceClass_100, OAC, Security Headers, SPA Fallback)
-   ├── /*         ──► [ Amazon S3 Bucket ] (Frontend SPA Statico: HTML5/CSS3/Vanilla JS)
-   └── /api/*     ──► [ AWS Application Load Balancer (ALB) ]
-                            │ (Port 80 -> NodePort 30080, X-Origin-Verify)
-                            ▼
-            [ Kubernetes Cluster su EC2 (Control Plane + Auto Scaling Group Workers) ]
-            ┌─────────────────────────────────────────────────────────┐
-            │  • EC2 Auto Scaling Group (Launch Template + SSM Join)  │
-            │  • Ingress Nginx Controller (NodePort: 30080)           │
-            │  • Auth Service (Node.js/Express, 2 Repliche, HPA)      │
-            │  • Booking Service (Node.js/Express, 2 Repliche, HPA)   │
-            │  • Drop Service (Node.js/Express, 2 Repliche, HPA)      │
-            │  • Notification Service (Python/Flask, 2 Repliche, HPA) │
-            │  • Calico CNI (NetworkPolicy Enforcement L3/L4)         │
-            └─────────────────────────────────────────────────────────┘
-                    │             │            │            │
-                    ▼             ▼            ▼            ▼
-             [ Amazon RDS ]  [ Amazon MQ ] [ ElastiCache ] [ DynamoDB ]
-             (PostgreSQL 15)  (RabbitMQ)     (Redis 7)     (Notifications)
-             (Encrypted gp3)  (AMQPS TLS)   (In-Transit)   (Pay-Per-Request)
-```
-
-### 🔄 Flusso degli eventi
-1. Un **cliente cancella** una prenotazione con anticipo < 24h $\rightarrow$ il *Booking Service* pubblica `booking.cancelled.late` su **Amazon MQ (RabbitMQ)**.
-2. Il **Drop Service** consuma l'evento: genera il record promozionale su **RDS PostgreSQL** e carica il payload su **ElastiCache Redis** con TTL dinamico.
-3. Più clienti tentano simultaneamente il claim $\rightarrow$ lo script Lua in **Redis** esegue il lock atomico: il primo riceve `202 Accepted`, mentre tutti gli altri ricevono istantaneamente `409 Conflict`.
-4. Il claim vincitore viene inviato sulla coda `drop.claims.processing` per la finalizzazione asincrona su RDS e l'aggiornamento dell'agenda su Booking Service.
-5. Il **Notification Service** consuma gli eventi e persiste l'audit trail delle notifiche su **Amazon DynamoDB**.
-
----
 
 ## 🛠 Stack Tecnologico & Mappatura Servizi AWS
 
@@ -142,102 +127,117 @@ Per scongiurare il **Thundering Herd Problem** e l'overselling durante i picchi 
 | `glamdrop-worker-asg` (x2) | ⚙️ Worker Nodes | `t3.micro` | 2 | 1 GB | Auto Scaling Group Multi-AZ (AZ-a & AZ-b), Self-Join via SSM |
 | `glamdrop-cni` | 🌐 Network Driver | Calico CNI | — | — | Overlay VXLAN + NetworkPolicies L3/L4 Zero-Trust |
 
-### 📦 Pipeline IaC & Deployment
+---
 
+## 🚀 Deployment su AWS
+
+Il deployment dell'infrastruttura e dei microservizi su AWS si articola in **3 fasi automatizzate**, eseguibili sia da ambienti Linux/macOS sia da Windows.
+
+
+### 🐧 Opzione A — Deploy da Linux / WSL / macOS
+
+#### ✅ Prerequisiti
+
+| Strumento | Versione Minima | Note |
+|:---|:---:|:---|
+| [AWS CLI](https://aws.amazon.com/cli/) | v2 | Configurata con `aws configure` |
+| [Terraform](https://www.terraform.io/) | 1.5+ | Provisioning IaC |
+| [Ansible](https://docs.ansible.com/) | 2.12+ | Configurazione cluster K8s |
+| [OpenSSH](https://www.openssh.com/) | — | Client SSH per Ansible |
+| [AWS SSM Plugin](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html) | — | Accesso SSH trasparente via SSM |
+| [Docker](https://docs.docker.com/get-docker/) | 20.10+ | Build e push immagini su ECR |
+| [kubectl](https://kubernetes.io/docs/tasks/tools/) | 1.31+ | Client CLI per Kubernetes |
+
+#### 1️⃣ Provisioning Infrastruttura con Terraform
+
+```bash
+cd terraform
+terraform init
+
+# Genera la chiave SSH per i nodi (se non già presente)
+ssh-keygen -t ed25519 -f id_ed25519 -N ""
+
+# Avvia il provisioning delle risorse su AWS
+terraform apply -auto-approve
 ```
-┌─────────────────────────────────┐
-│     1. TERRAFORM APPLY          │ ──► Crea VPC, EC2, RDS, ElastiCache, MQ, ALB, SSM, S3/CDN
-└────────────────┬────────────────┘
-                 │
-                 ▼
-┌─────────────────────────────────┐
-│     2. ANSIBLE PLAYBOOK         │ ──► Inizializza Control Plane, Calico CNI e Join Token su SSM
-└────────────────┬────────────────┘
-                 │
-                 ▼
-┌─────────────────────────────────┐
-│     3. ASG SELF-BOOTSTRAP       │ ──► I nodi Worker recuperano il token da SSM e si uniscono
-└────────────────┬────────────────┘
-                 │
-                 ▼
-┌─────────────────────────────────┐
-│     4. ./deploy.sh              │ ──► Build & Push ECR, Apply Manifests K8s, Sync S3 Frontend
-└─────────────────────────────────┘
-```
 
----
+*Terraform creerà la VPC Multi-AZ, i Security Group, l'EC2 Control Plane, il Launch Template e l'ASG Worker, RDS PostgreSQL, ElastiCache Redis, Amazon MQ, DynamoDB, l'ALB, il bucket S3 con CloudFront OAC e genererà automaticamente `ansible/hosts.ini` e `k8s/secret.yaml`.*
 
-## 🚀 Guida al Deployment su AWS (Step-by-Step)
-
-Il deployment completo dell'Infrastruttura A si esegue in **3 passaggi automatizzati**:
-
-### ✅ Prerequisiti
-- **AWS CLI (v2)** installata e autenticata (`aws configure`).
-- **Terraform** (>= 1.5.0).
-- **Ansible** (>= 2.12) e client **OpenSSH** (su Linux o WSL2).
-- **AWS Session Manager Plugin** per accesso SSH trasparente via SSM.
-- **Docker** (opzionale, per compilare e caricare le immagini su ECR).
-
----
-
-### 1️⃣ Passo 1: Provisioning dell'Infrastruttura con Terraform
-
-1. Spostati nella cartella `terraform/`:
-   ```bash
-   cd terraform
-   terraform init
-   ```
-2. Genera la chiave SSH per i nodi (se non già presente):
-   ```bash
-   ssh-keygen -t ed25519 -f id_ed25519 -N ""
-   ```
-3. Avvia il provisioning delle risorse su AWS:
-   ```bash
-   terraform apply -auto-approve
-   ```
-   *Terraform creerà la VPC Multi-AZ, i Security Group concatenati, l'EC2 Control Plane, il Launch Template e l'ASG Worker, RDS PostgreSQL, ElastiCache Redis, Amazon MQ, DynamoDB, l'ALB, il bucket S3 con CloudFront OAC e genererà automaticamente `ansible/hosts.ini` e `k8s/secret.yaml`.*
-
----
-
-### 2️⃣ Passo 2: Configurazione del Cluster con Ansible
-
-Dalla root del repository, esegui il playbook Ansible (oppure usa lo script helper):
+#### 2️⃣ Configurazione del Cluster con Ansible
 
 ```bash
 cd ansible
 bash run-ansible.sh
-```
 
-*In alternativa tramite comando diretto:*
-```bash
+# In alternativa, tramite comando diretto:
 ansible-playbook -i hosts.ini site.yml
 ```
 
-#### Cosa esegue Ansible:
+**Cosa esegue Ansible:**
 - **`00-prerequisites.yml`**: Configura parametri kernel sysctl, swapfile da 2GB, runtime **containerd** e tool **Kubernetes v1.31**.
-- **`01-control-plane.yml`**: Esegue `kubeadm init`, installa **Calico CNI**, genera il token di join permanente e lo salva su **AWS SSM Parameter Store** (`/glamdrop/k8s/join_command`). I nodi worker dell'ASG prelevano autonomamente il token all'avvio completando il bootstrap.
+- **`01-control-plane.yml`**: Esegue `kubeadm init`, installa **Calico CNI**, genera il token di join permanente e lo salva su **AWS SSM Parameter Store** (`/glamdrop/k8s/join_command`). I nodi worker dell'ASG prelevano autonomamente il token all'avvio.
 
----
-
-### 3️⃣ Passo 3: Deployment dei Microservizi e Frontend (`deploy.sh` / `deploy.ps1`)
-
-Dalla radice del repository, lancia lo script orchestratore (Bash su Linux/WSL/Git Bash o PowerShell su Windows):
+#### 3️⃣ Deployment Microservizi e Frontend
 
 ```bash
-# Su Linux / WSL / Git Bash:
+# Dalla root del repository
 chmod +x deploy.sh
 ./deploy.sh
+```
 
-# Oppure su Windows PowerShell:
+![divider](https://capsule-render.vercel.app/api?type=soft&color=0:FF69B4,100:FFA500&height=3&section=header)
+
+### 🪟 Opzione B — Deploy da Windows (PowerShell)
+
+#### ✅ Prerequisiti
+
+| Strumento | Versione Minima | Note |
+|:---|:---:|:---|
+| [AWS CLI](https://aws.amazon.com/cli/) | v2 | Configurata con `aws configure` |
+| [Terraform](https://www.terraform.io/) | 1.5+ | Provisioning IaC |
+| [WSL 2](https://docs.microsoft.com/en-us/windows/wsl/) | — | Con Ansible installato al suo interno |
+| [AWS SSM Plugin](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html) | — | Accesso SSH trasparente via SSM |
+| [Docker Desktop](https://www.docker.com/products/docker-desktop/) | 4.0+ | Build e push immagini su ECR |
+| [kubectl](https://kubernetes.io/docs/tasks/tools/) | 1.31+ | Client CLI per Kubernetes |
+
+#### 1️⃣ Provisioning Infrastruttura con Terraform
+
+```powershell
+cd terraform
+terraform init
+
+# Genera la chiave SSH per i nodi (se non già presente)
+ssh-keygen -t ed25519 -f id_ed25519 -N '""'
+
+# Avvia il provisioning
+terraform apply -auto-approve
+```
+
+#### 2️⃣ Configurazione del Cluster con Ansible (via WSL)
+
+```powershell
+# Ansible richiede un ambiente Linux — esecuzione tramite WSL
+wsl bash -c "cd ansible && bash run-ansible.sh"
+```
+
+#### 3️⃣ Deployment Microservizi e Frontend
+
+```powershell
+# Dalla root del repository
 .\deploy.ps1
 ```
 
-#### Fasi eseguite automaticamente dallo script:
-1. **Recupero Parametri**: Estrae gli endpoint live dagli output Terraform (IP Control Plane, S3, CloudFront, ECR).
-2. **Deploy Frontend**: Sincronizza i file statici su S3 e richiede l'invalidazione della cache CloudFront.
-3. **Build & Push ECR**: Compila le immagini Docker dei quattro microservizi e le carica sui repository Amazon ECR.
-4. **Trasferimento Manifesti**: Invia in sicurezza i manifesti Kubernetes al Control Plane tramite tunnel AWS SSM Session Manager.
-5. **Rollout Kubernetes**: Applica Namespace, Secret, NetworkPolicies Calico, Ingress Nginx Controller (NodePort 30080), microservizi backend e regole HPA/PDB.
+![divider](https://capsule-render.vercel.app/api?type=soft&color=0:FF69B4,100:FFA500&height=3&section=header)
+
+### 📋 Fasi Eseguite dallo Script di Deploy
+
+Indipendentemente dalla piattaforma, lo script di deploy esegue automaticamente:
+
+1. **Recupero Parametri** → Estrae gli endpoint live dagli output Terraform (IP Control Plane, S3, CloudFront, ECR)
+2. **Deploy Frontend** → Sincronizza i file statici su S3 e richiede l'invalidazione della cache CloudFront
+3. **Build & Push ECR** → Compila le immagini Docker dei quattro microservizi e le carica sui repository Amazon ECR
+4. **Trasferimento Manifesti** → Invia i manifesti Kubernetes al Control Plane tramite tunnel AWS SSM Session Manager
+5. **Rollout Kubernetes** → Applica Namespace, Secret, NetworkPolicies Calico, Ingress Nginx Controller (NodePort 30080), microservizi backend e regole HPA/PDB
 
 Al termine, l'applicazione sarà accessibile pubblicamente all'URL CloudFront:
 ```
@@ -270,7 +270,6 @@ REDIS_URL=rediss://:auth_token@glamdrop-redis.xxxx.cache.amazonaws.com:6379
 > [!IMPORTANT]
 > Il file `k8s/secret.yaml` viene **generato automaticamente da Terraform** durante la fase di provisioning, iniettando le password casuali generate e gli endpoint effettivi dei servizi AWS gestiti. Non è necessario modificare manualmente i segreti per il deployment su AWS.
 
----
 
 ## 🧪 Test Automatizzati
 
@@ -288,37 +287,6 @@ Verifica i vincoli di non sovrapposizione degli appuntamenti per lo stesso opera
 python tests/test-booking-overlap.py --endpoint https://<CLOUDFRONT_DOMAIN>/api
 ```
 
-| # | Scenario di Test | Esito Atteso |
-|:---:|---|:---:|
-| 1 | Prenotazione slot base (10:00–11:00) | ✅ Confermata (201) |
-| 2 | Stesso identico orario sullo stesso operatore | ❌ Conflitto (409) |
-| 3 | Sovrapposizione parziale inizio (10:30–11:30) | ❌ Conflitto (409) |
-| 4 | Sovrapposizione parziale fine (09:30–10:30) | ❌ Conflitto (409) |
-| 5 | Intervallo interamente contenuto (10:15–10:45) | ❌ Conflitto (409) |
-| 6 | Slot adiacente senza sovrapposizione (11:00–12:00) | ✅ Confermata (201) |
-| 7 | Cancellazione e ri-prenotazione dello stesso slot | ✅ Confermata (201) |
-
----
-
-## 🛡️ Sicurezza, Hardening e DevSecOps
-
-- **Crittografia Completa**:
-  - **RDS PostgreSQL**: storage cifrato con AWS KMS, parametro `rds.force_ssl=1` e certificato CA AWS.
-  - **Amazon MQ**: endpoint AMQPS con canale TLS obbligatorio (porta 5671).
-  - **ElastiCache Redis**: crittografia at-rest KMS, in-transit TLSv1.2 e autenticazione obbligatoria tramite Redis AUTH.
-  - **Amazon S3 & CloudFront**: crittografia SSE-S3 AES-256, forzatura HTTPS e policy Origin Access Control (OAC).
-- **Protezione Perimetrale ALB**:
-  - Validazione header segreto `X-Origin-Verify` generato da Terraform: l'ALB risponde con HTTP `403 Forbidden` a qualsiasi richiesta che tenti di bypassare CloudFront.
-- **Isolamento di Rete & NetworkPolicies**:
-  - Database e broker confinati in Subnet Private prive di rotte Internet.
-  - Policy **Calico CNI** Zero-Trust con blocco predefinito del traffico (*default-deny*) e autorizzazione granulare solo tra i pod necessari.
-- **Hardening dei Container**:
-  - Esecuzione obbligatoria con utente non-root, `allowPrivilegeEscalation: false` e drop di tutte le capabilities Linux (`drop: ALL`).
-- **Pipeline DevSecOps CI/CD**:
-  - Scansione secret con **Gitleaks**, analisi statica del codice (SAST) con **Semgrep** e conformità IaC con **Checkov**.
-
----
-
 ## 🧹 Teardown dell'Infrastruttura
 
 Per distruggere determinatisticamente tutte le risorse create su AWS ed azzerare i costi:
@@ -328,7 +296,34 @@ cd terraform
 terraform destroy -auto-approve
 ```
 
----
+## 📂 Struttura del Progetto
+
+```
+GlamDrop_EC2/
+├── 📄 README.md
+├── 📄 LICENSE
+├── 📄 .gitignore
+├── 🔧 deploy.sh                          # Script deploy completo (Linux/macOS)
+├── 🔧 deploy.ps1                         # Script deploy completo (Windows)
+├── 📁 docs/
+│   └── 📁 assets/                        # Logo e diagrammi architetturali
+├── 📁 services/
+│   ├── 📁 auth-service/                  # Microservizio autenticazione (Node.js/Express)
+│   ├── 📁 booking-service/               # Microservizio prenotazioni (Node.js/Express)
+│   ├── 📁 drop-service/                  # Microservizio promozioni flash (Node.js/Express)
+│   └── 📁 notification-service/          # Microservizio notifiche (Python/Flask)
+├── 📁 frontend/                          # Frontend SPA (HTML/CSS/JS)
+├── 📁 terraform/                         # Configurazione Terraform (VPC, EC2, RDS, Redis, MQ, ALB, S3, CDN)
+├── 📁 ansible/                           # Playbook Ansible (setup K8s + Calico CNI)
+│   ├── 📄 hosts.ini                      # Generato automaticamente da Terraform
+│   ├── 📄 site.yml
+│   └── 🔧 run-ansible.sh
+├── 📁 k8s/                               # Manifest Kubernetes
+│   └── 📄 *.yaml                         # Deployment, Service, Ingress, NetworkPolicy, HPA, PDB, Secret
+└── 📁 tests/
+    ├── 📄 test-concurrency.py            # Test Thundering Herd (50 client concorrenti)
+    └── 📄 test-booking-overlap.py        # Test sovrapposizione prenotazioni (7 scenari)
+```
 
 <div align="center">
 
